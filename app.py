@@ -41,8 +41,13 @@ httpx_client = httpx.Client()
 app = Flask(__name__)
 api_key = os.getenv('API_KEY')
 json_sort_key = os.getenv("JSON_SORT_KEYS")
-CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
-
+CORS(
+  app,
+  resources={r"/*": {"origins": "*"}},
+  supports_credentials=True,
+  methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allow_headers=["*"]
+)
 app.config[json_sort_key] = False
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
@@ -65,10 +70,16 @@ cache = AdvancedCache(max_size=2000, ttl_seconds=7200)
 rate_limiter = RateLimiter(max_requests=50, window_seconds=3600)
 
 
-@app.route('/')
+@app.route('/info')
 def home():
     """API documentation page"""
-    return render_template("index.html")
+    return render_template("index.html" )
+
+
+@app.route('/')
+def home2():
+    """API documentation page"""
+    return render_template("Home.html" )
 
 
 
@@ -232,6 +243,8 @@ def generate_mcqs_from_pdf():
             "message": "An unexpected error occurred while processing the PDF",
             "details": str(e)
         }), 500
+        
+
         
 @app.route('/debug_pdf', methods=['POST'])
 def debug_pdf():
