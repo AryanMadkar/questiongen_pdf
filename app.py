@@ -49,12 +49,15 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
 
+
+
+    
 # Initialize LangChain components
 chat_model = ChatGroq(
     temperature=0.2,
     model="llama3-8b-8192",
     api_key=GROQ_API_KEY, # type: ignore
-    max_tokens=4000,
+    max_tokens=8000,
     http_client=httpx_client
 )
 
