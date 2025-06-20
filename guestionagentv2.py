@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template,render_template_string
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -16,7 +16,7 @@ import threading
 from collections import defaultdict
 from dotenv import load_dotenv
 import httpx
-import PyPDF2
+import PyPDF2 # type: ignore
 from werkzeug.utils import secure_filename
 from io import BytesIO
 import tempfile
@@ -47,10 +47,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
 # Initialize LangChain components
 chat_model = ChatGroq(
     temperature=0.2,
-    model_name="llama3-8b-8192",
-    groq_api_key=GROQ_API_KEY,
+    model="llama3-8b-8192",
+    api_key=GROQ_API_KEY, # type: ignore
     max_tokens=4000,
-    top_p=0.9,
     http_client=httpx_client
 )
 
@@ -568,98 +567,7 @@ def calculate_difficulty_score(difficulty: str) -> float:
 @app.route('/')
 def home():
     """API documentation page"""
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Enhanced MCQ Generator API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
-            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-            h1 { color: #333; text-align: center; }
-            .endpoint { background: #f8f9fa; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #007bff; }
-            .method { background: #28a745; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; }
-            .method.post { background: #007bff; }
-            code { background: #e9ecef; padding: 2px 4px; border-radius: 3px; }
-            .example { background: #f1f3f4; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🧠 Enhanced MCQ Generator API</h1>
-            
-            <div class="endpoint">
-                <h3><span class="method post">POST</span> /generate_mcqs</h3>
-                <p><strong>Generate high-quality multiple choice questions from topic</strong></p>
-                
-                <h4>Request Body:</h4>
-                <div class="example">
-                    <code>
-                    {<br>
-                    &nbsp;&nbsp;"topic": "Machine Learning",<br>
-                    &nbsp;&nbsp;"difficulty": "medium",<br>
-                    &nbsp;&nbsp;"num_questions": 5,<br>
-                    &nbsp;&nbsp;"question_type": "academic"<br>
-                    }
-                    </code>
-                </div>
-            </div>
-            
-            <div class="endpoint">
-                <h3><span class="method post">POST</span> /generate_mcqs_from_pdf</h3>
-                <p><strong>📄 Generate MCQs from uploaded PDF document</strong></p>
-                
-                <h4>Form Data:</h4>
-                <div class="example">
-                    <code>
-                    pdf_file: [PDF file]<br>
-                    num_questions: 10 (optional, default: 10)<br>
-                    difficulty: "medium" (optional, default: medium)<br>
-                    question_type: "academic" (optional, default: academic)
-                    </code>
-                </div>
-                
-                <h4>Parameters:</h4>
-                <ul>
-                    <li><code>pdf_file</code> (required): PDF file to upload (max 16MB)</li>
-                    <li><code>num_questions</code>: 1-50 questions (default: 10)</li>
-                    <li><code>difficulty</code>: easy, medium, hard, expert (default: medium)</li>
-                    <li><code>question_type</code>: academic, practical, conceptual (default: academic)</li>
-                </ul>
-            </div>
-            
-            <div class="endpoint">
-                <h3><span class="method">GET</span> /health</h3>
-                <p>Check API health status</p>
-            </div>
-            
-            <div class="endpoint">
-                <h3><span class="method">GET</span> /stats</h3>
-                <p>Get API usage statistics</p>
-            </div>
-            
-            <h3>🚀 Features:</h3>
-            <ul>
-                <li>✅ PDF text extraction and processing</li>
-                <li>✅ Advanced caching with TTL</li>
-                <li>✅ Rate limiting protection</li>
-                <li>✅ Multiple question types</li>
-                <li>✅ Bloom's taxonomy classification</li>
-                <li>✅ Quality validation</li>
-                <li>✅ Detailed explanations</li>
-                <li>✅ Analytics and metrics</li>
-                <li>✅ LangChain integration</li>
-                <li>✅ Automatic topic detection from PDFs</li>
-            </ul>
-            
-            <h3>📋 Supported File Types:</h3>
-            <ul>
-                <li>PDF files (.pdf) - up to 16MB</li>
-            </ul>
-        </div>
-    </body>
-    </html>
-    """)
+    return render_template("index.html")
 
 @app.route('/generate_mcqs_from_pdf', methods=['POST'])
 def generate_mcqs_from_pdf():
@@ -781,7 +689,7 @@ def generate_mcqs_from_pdf():
                     enhanced_data = enhance_response(json_data)
                     
                     # Add PDF-specific metadata
-                    enhanced_data["metadata"]["source_file"] = secure_filename(file.filename)
+                    enhanced_data["metadata"]["source_file"] = secure_filename(file.filename) # type: ignore
                     enhanced_data["metadata"]["content_length"] = len(text_content)
                     enhanced_data["metadata"]["auto_generated_topic"] = topic
                     enhanced_data["metadata"]["extraction_method"] = "PyPDF2"
