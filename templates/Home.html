@@ -240,6 +240,12 @@
             transform: translateX(5px);
         }
 
+        .question-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
         .question-number {
             background: #667eea;
             color: white;
@@ -250,7 +256,14 @@
             align-items: center;
             justify-content: center;
             font-weight: bold;
-            margin-bottom: 15px;
+            margin-right: 15px;
+        }
+
+        .question-meta {
+            font-size: 12px;
+            color: #666;
+            display: flex;
+            gap: 15px;
         }
 
         .question-text {
@@ -320,6 +333,28 @@
             margin-top: 5px;
         }
 
+        .question-type-distribution {
+            background: #f0f8ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+
+        .type-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .type-stat {
+            background: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            border: 1px solid #ddd;
+        }
+
         .error {
             background: #fff5f5;
             border: 1px solid #fed7d7;
@@ -343,6 +378,7 @@
             display: flex;
             gap: 15px;
             justify-content: center;
+            flex-wrap: wrap;
         }
 
         .btn-secondary {
@@ -371,6 +407,14 @@
             
             .header h1 {
                 font-size: 2rem;
+            }
+
+            .metadata-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .export-buttons {
+                flex-direction: column;
             }
         }
     </style>
@@ -409,14 +453,15 @@
 
                         <div class="form-group">
                             <label for="num_questions">Number of Questions:</label>
-                            <input type="number" id="num_questions" name="num_questions" min="1" max="10" value="5">
+                            <input type="number" id="num_questions" name="num_questions" min="1" max="50" value="5">
                         </div>
 
                         <div class="form-group">
                             <label for="question_type">Question Type:</label>
                             <select id="question_type" name="question_type">
                                 <option value="academic" selected>Academic</option>
-                               
+                                <option value="practical">Practical</option>
+                                <option value="conceptual">Conceptual</option>
                             </select>
                         </div>
 
@@ -452,14 +497,15 @@
 
                         <div class="form-group">
                             <label for="pdf_num_questions">Number of Questions:</label>
-                            <input type="number" id="pdf_num_questions" name="num_questions" min="1" max="10" value="5">
+                            <input type="number" id="pdf_num_questions" name="num_questions" min="1" max="50" value="5">
                         </div>
 
                         <div class="form-group">
                             <label for="pdf_question_type">Question Type:</label>
                             <select id="pdf_question_type" name="question_type">
                                 <option value="academic" selected>Academic</option>
-                                
+                                <option value="practical">Practical</option>
+                                <option value="conceptual">Conceptual</option>
                             </select>
                         </div>
 
@@ -485,7 +531,9 @@
     </div>
 
     <script>
-        const API_BASE_URL = 'https://questiongen-pdf.onrender.com';
+        // Update this to match your Flask app's URL
+        const API_BASE_URL = 'http://localhost:5000'; // Change this to your actual server URL
+
         let currentQuestions = null;
 
         // Tab switching
@@ -624,6 +672,10 @@
                         <div style="font-size: 48px; margin-bottom: 20px;">❌</div>
                         <h3>Generation Failed</h3>
                         <p>${error.message}</p>
+                        <div style="margin-top: 20px; font-size: 14px;">
+                            <p>Make sure your Flask server is running on the correct port.</p>
+                            <p>Current API URL: <strong>${API_BASE_URL}</strong></p>
+                        </div>
                     </div>
                 `;
             } finally {
@@ -645,7 +697,7 @@
 
             let html = '';
 
-            // Metadata section
+            // Metadata section with enhanced features
             if (data.metadata) {
                 html += `
                     <div class="metadata">
@@ -668,6 +720,24 @@
                                 <div class="metadata-label">Cached</div>
                             </div>
                         </div>
+                        
+                        ${data.metadata.source_file ? `
+                            <div style="margin-top: 15px; text-align: center;">
+                                <strong>📄 Source File:</strong> ${data.metadata.source_file}<br>
+                                <strong>📝 Auto-Generated Topic:</strong> ${data.metadata.auto_generated_topic || 'N/A'}
+                            </div>
+                        ` : ''}
+                        
+                        ${data.metadata.question_type_distribution ? `
+                            <div class="question-type-distribution">
+                                <h4>🎯 Question Type Distribution</h4>
+                                <div class="type-stats">
+                                    ${Object.entries(data.metadata.question_type_distribution).map(([type, count]) => 
+                                        `<div class="type-stat">${type}: ${count}</div>`
+                                    ).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
                     </div>
                 `;
             }
@@ -676,14 +746,22 @@
             data.questions.forEach((question, index) => {
                 html += `
                     <div class="question-card">
-                        <div class="question-number">${index + 1}</div>
+                        <div class="question-header">
+                            <div class="question-number">${index + 1}</div>
+                            <div class="question-meta">
+                                ${question.question_type ? `<span>🏷️ ${question.question_type}</span>` : ''}
+                                ${question.bloom_level ? `<span>🎯 ${question.bloom_level}</span>` : ''}
+                                ${question.estimated_time_seconds ? `<span>⏱️ ${question.estimated_time_seconds}s</span>` : ''}
+                            </div>
+                        </div>
+                        
                         <div class="question-text">${question.question}</div>
                         
                         <div class="options">
                             ${Object.entries(question.options).map(([key, value]) => `
                                 <div class="option ${key === question.correct_answer ? 'correct' : ''}" 
                                      data-option="${key}">
-                                    <strong>${key}:</strong> ${value}
+                                    <strong>${key})</strong> ${value}
                                 </div>
                             `).join('')}
                         </div>
@@ -691,13 +769,6 @@
                         ${question.explanation ? `
                             <div class="explanation">
                                 <strong>💡 Explanation:</strong> ${question.explanation}
-                            </div>
-                        ` : ''}
-                        
-                        ${question.bloom_level || question.estimated_time_seconds ? `
-                            <div style="margin-top: 15px; font-size: 14px; color: #666;">
-                                ${question.bloom_level ? `<span>🎯 Level: ${question.bloom_level}</span>` : ''}
-                                ${question.estimated_time_seconds ? `<span style="margin-left: 15px;">⏱️ Time: ${question.estimated_time_seconds}s</span>` : ''}
                             </div>
                         ` : ''}
                     </div>
@@ -710,6 +781,7 @@
                     <button class="btn-secondary" onclick="exportToJSON()">📄 Export JSON</button>
                     <button class="btn-secondary" onclick="exportToText()">📝 Export Text</button>
                     <button class="btn-secondary" onclick="printQuestions()">🖨️ Print</button>
+                    <button class="btn-secondary" onclick="copyToClipboard()">📋 Copy</button>
                 </div>
             `;
 
@@ -747,6 +819,9 @@
                 if (q.explanation) {
                     text += `   Explanation: ${q.explanation}\n`;
                 }
+                if (q.question_type) {
+                    text += `   Type: ${q.question_type}\n`;
+                }
                 text += '\n';
             });
             
@@ -757,6 +832,26 @@
             link.download = `mcq_questions_${Date.now()}.txt`;
             link.click();
             URL.revokeObjectURL(url);
+        }
+
+        function copyToClipboard() {
+            if (!currentQuestions) return;
+            
+            let text = `MCQ Questions - ${currentQuestions.metadata?.topic || 'Generated'}\n\n`;
+            
+            currentQuestions.questions.forEach((q, i) => {
+                text += `${i + 1}. ${q.question}\n`;
+                Object.entries(q.options).forEach(([key, value]) => {
+                    text += `   ${key}) ${value}\n`;
+                });
+                text += `   Answer: ${q.correct_answer}\n\n`;
+            });
+            
+            navigator.clipboard.writeText(text).then(() => {
+                showSuccess('Questions copied to clipboard!');
+            }).catch(() => {
+                showError('Failed to copy to clipboard');
+            });
         }
 
         function printQuestions() {
@@ -772,54 +867,83 @@
                         <style>
                             body { font-family: Arial, sans-serif; margin: 20px; }
                             .question-card { margin-bottom: 30px; page-break-inside: avoid; }
+                            .question-header { display: flex; align-items: center; margin-bottom: 10px; }
                             .question-number { display: inline-block; background: #667eea; color: white; 
                                                width: 25px; height: 25px; text-align: center; border-radius: 50%; 
-                                               margin-right: 10px; }
+                                               margin-right: 10px; line-height: 25px; }
+                            .question-meta { font-size: 12px; color: #666; }
                             .option { margin: 5px 0; padding: 8px; }
-                            .option.correct { background: #e8f5e8; }
-                            .explanation { background: #f0f8ff; padding: 10px; margin-top: 10px; border-left: 3px solid #007bff; }
+                            .option.correct { background: #e8f5e8; font-weight: bold; }
+                            .explanation { background: #e7f3ff; padding: 10px; margin-top: 10px; border-left: 3px solid #007bff; }
+                            .metadata { background: #f8f9fa; padding: 15px; margin-bottom: 20px; border-radius: 10px; }
                             .export-buttons { display: none; }
                         </style>
                     </head>
-                    <body>${printContent}</body>
+                    <body>
+                        <h1>MCQ Questions - ${currentQuestions.metadata?.topic || 'Generated'}</h1>
+                        <div>${printContent}</div>
+                        <script>
+                            window.onload = function() {
+                                window.print();
+                                window.onafterprint = function() {
+                                    window.close();
+                                };
+                            };
+                        <\/script>
+                    </body>
                 </html>
             `);
-            
             printWindow.document.close();
-            printWindow.print();
         }
 
-        // Utility functions
+        // Notification functions
         function showError(message) {
-            const toast = document.createElement('div');
-            toast.className = 'error';
-            toast.style.position = 'fixed';
-            toast.style.top = '20px';
-            toast.style.right = '20px';
-            toast.style.zIndex = '1000';
-            toast.style.maxWidth = '400px';
-            toast.innerHTML = `❌ ${message}`;
+            // Create a temporary error message element at the top
+            const errorEl = document.createElement('div');
+            errorEl.className = 'error';
+            errorEl.innerHTML = message;
+            errorEl.style.position = 'fixed';
+            errorEl.style.top = '20px';
+            errorEl.style.left = '50%';
+            errorEl.style.transform = 'translateX(-50%)';
+            errorEl.style.padding = '15px';
+            errorEl.style.borderRadius = '8px';
+            errorEl.style.zIndex = '1000';
+            errorEl.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
+            errorEl.style.maxWidth = '90%';
+            errorEl.style.textAlign = 'center';
             
-            document.body.appendChild(toast);
-            setTimeout(() => toast.remove(), 5000);
+            document.body.appendChild(errorEl);
+            
+            // Remove after 5 seconds
+            setTimeout(() => {
+                errorEl.remove();
+            }, 5000);
         }
 
         function showSuccess(message) {
-            const toast = document.createElement('div');
-            toast.className = 'success';
-            toast.style.position = 'fixed';
-            toast.style.top = '20px';
-            toast.style.right = '20px';
-            toast.style.zIndex = '1000';
-            toast.style.maxWidth = '400px';
-            toast.innerHTML = `✅ ${message}`;
+            // Create a temporary success message element at the top
+            const successEl = document.createElement('div');
+            successEl.className = 'success';
+            successEl.innerHTML = message;
+            successEl.style.position = 'fixed';
+            successEl.style.top = '20px';
+            successEl.style.left = '50%';
+            successEl.style.transform = 'translateX(-50%)';
+            successEl.style.padding = '15px';
+            successEl.style.borderRadius = '8px';
+            successEl.style.zIndex = '1000';
+            successEl.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
+            successEl.style.maxWidth = '90%';
+            successEl.style.textAlign = 'center';
             
-            document.body.appendChild(toast);
-            setTimeout(() => toast.remove(), 3000);
+            document.body.appendChild(successEl);
+            
+            // Remove after 5 seconds
+            setTimeout(() => {
+                successEl.remove();
+            }, 5000);
         }
-
-        // Initialize
-        console.log('MCQ Generator Pro loaded successfully!');
     </script>
 </body>
 </html>

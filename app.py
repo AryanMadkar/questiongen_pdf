@@ -1,7 +1,7 @@
 from AdvanceCache.Caching import AdvancedCache
 from Ratelimiter.Limiter import RateLimiter
-from prompt_templates.Templates import build_prompt_template,build_prompt_template_pdf
-from utils.Extraction_pdf import extract_text_from_pdf,generate_topic_from_text
+from prompt_templates.Templates import build_prompt_template,build_prompt_template_pdf,extract_topic_from_pdf_content
+from utils.Extraction_pdf import extract_text_from_pdf
 from flask import Flask, request, jsonify, render_template,render_template_string
 from utils.Helpers import validate_input,validate_generated_content,generate_cache_key,allowed_file,enhance_response,calculate_difficulty_score
 from utils.Debuger_pdf import debug_pdf_info
@@ -54,13 +54,11 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
 
-
-
-    
 # Initialize LangChain components
 chat_model = ChatGroq(
     temperature=0.2,
-    model="llama3-8b-8192",
+    # model="llama3-8b-8192",
+    model="llama3-70b-8192",
     api_key=GROQ_API_KEY, # type: ignore
     max_tokens=8000,
     http_client=httpx_client
@@ -82,10 +80,9 @@ def home2():
     return render_template("Home.html" )
 
 
-
 @app.route('/generate_mcqs_from_pdf', methods=['POST'])
 def generate_mcqs_from_pdf():
-    """Generate MCQs from uploaded PDF file with improved error handling"""
+    """Generate MCQs from uploaded PDF file with enhanced question types and improved topic extraction"""
     try:
         # Check if file is present
         if 'pdf_file' not in request.files:
@@ -152,9 +149,25 @@ def generate_mcqs_from_pdf():
         logger.info(f"Successfully extracted {len(text_content)} characters from PDF")
         logger.debug(f"Text sample: {text_content[:200]}...")
         
-        # Generate topic from text
-        topic = generate_topic_from_text(text_content)
-        logger.info(f"Generated topic: {topic}")
+        # Generate topic from text using enhanced extraction
+        topic = extract_topic_from_pdf_content(text_content)
+        logger.info(f"Enhanced topic extraction result: {topic}")
+        
+        # Validate extracted topic
+        if not topic or topic == "Document Content Analysis":
+            logger.warning("Could not extract meaningful topic, using fallback")
+            # Try to get a better topic by analyzing content
+            words = text_content.lower().split()
+            if len(words) > 50:
+                # Use first meaningful sentence as topic
+                sentences = text_content.split('.')
+                for sentence in sentences[:3]:
+                    sentence = sentence.strip()
+                    if 20 <= len(sentence) <= 100 and not sentence.lower().startswith(('the', 'a', 'an')):
+                        topic = sentence
+                        break
+            if not topic or topic == "Document Content Analysis":
+                topic = f"Document Analysis - {secure_filename(file.filename).replace('.pdf', '')}"
         
         # Check cache (based on text hash)
         text_hash = hashlib.md5(text_content.encode()).hexdigest()
@@ -165,7 +178,7 @@ def generate_mcqs_from_pdf():
             logger.info("Cache hit for PDF content")
             return jsonify({**cached_result, "cached": True})
         
-        # Build LangChain prompt for PDF content
+        # Build LangChain prompt for PDF content with enhanced question types
         prompt_template = build_prompt_template_pdf(question_type)
         timestamp = datetime.now().isoformat()
         
@@ -183,7 +196,7 @@ def generate_mcqs_from_pdf():
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"Generating MCQs (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
+                logger.info(f"Generating MCQs with enhanced question types (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
                 
                 # Invoke LangChain
                 response = chain.invoke({
@@ -202,16 +215,31 @@ def generate_mcqs_from_pdf():
                     # Enhance response with PDF-specific metadata
                     enhanced_data = enhance_response(json_data)
                     
-                    # Add PDF-specific metadata
+                    # Add PDF-specific metadata with enhanced question types info
                     enhanced_data["metadata"]["source_file"] = secure_filename(file.filename) # type: ignore
                     enhanced_data["metadata"]["content_length"] = len(text_content)
                     enhanced_data["metadata"]["auto_generated_topic"] = topic
-                    enhanced_data["metadata"]["extraction_method"] = "PyPDF2"
+                    enhanced_data["metadata"]["extraction_method"] = "Enhanced PyPDF2 with NLP"
+                    enhanced_data["metadata"]["topic_extraction_strategy"] = "Multi-strategy analysis"
+                    
+                    # Add question type distribution stats
+                    question_types_count = {}
+                    for question in enhanced_data.get("questions", []):
+                        q_type = question.get("question_type", "unknown")
+                        question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
+                    
+                    enhanced_data["metadata"]["question_type_distribution"] = question_types_count
+                    enhanced_data["metadata"]["enhanced_features"] = {
+                        "multi_type_questions": True,
+                        "subject_performance_tracking": True,
+                        "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
+                    }
                     
                     # Cache the result
                     cache.set(cache_key, enhanced_data)
                     
-                    logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for topic: {topic}")
+                    logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions with enhanced types for topic: {topic}")
+                    logger.info(f"Question type distribution: {question_types_count}")
                     return jsonify({**enhanced_data, "cached": False})
                 
                 logger.warning(f"Invalid content generated on attempt {attempt + 1}")
@@ -232,7 +260,8 @@ def generate_mcqs_from_pdf():
             "debug_info": {
                 "topic": topic,
                 "text_length": len(text_content),
-                "text_sample": text_content[:200] + "..." if len(text_content) > 200 else text_content
+                "text_sample": text_content[:200] + "..." if len(text_content) > 200 else text_content,
+                "extraction_method": "Enhanced multi-strategy"
             }
         }), 500
         
@@ -248,7 +277,7 @@ def generate_mcqs_from_pdf():
         
 @app.route('/debug_pdf', methods=['POST'])
 def debug_pdf():
-    """Debug endpoint to check PDF processing without generating questions"""
+    """Debug endpoint to check PDF processing with enhanced topic extraction"""
     try:
         if 'pdf_file' not in request.files:
             return jsonify({"error": "No PDF file provided"}), 400
@@ -274,9 +303,17 @@ def debug_pdf():
         }
         
         if success:
-            # Try topic generation
-            topic = generate_topic_from_text(text_content)
-            result["generated_topic"] = topic
+            # Try enhanced topic generation
+            topic = extract_topic_from_pdf_content(text_content)
+            result["enhanced_topic_extraction"] = topic
+            
+            # Show extraction strategies used
+            lines = text_content.strip().split('\n')
+            result["topic_extraction_debug"] = {
+                "first_5_lines": lines[:5] if lines else [],
+                "text_word_count": len(text_content.split()),
+                "extraction_strategy_used": "Multi-strategy analysis"
+            }
         
         return jsonify(result)
         
@@ -287,7 +324,7 @@ def debug_pdf():
     
 @app.route('/generate_mcqs', methods=['POST'])
 def generate_mcqs():
-    """Enhanced MCQ generation endpoint with LangChain"""
+    """Enhanced MCQ generation endpoint with improved question types"""
     try:
         data = request.get_json()
         
@@ -314,7 +351,7 @@ def generate_mcqs():
             logger.info(f"Cache hit for topic: {topic}")
             return jsonify({**cached_result, "cached": True})
         
-        # Build LangChain prompt
+        # Build LangChain prompt with enhanced question types
         prompt_template = build_prompt_template(question_type)
         timestamp = datetime.now().isoformat()
         
@@ -330,13 +367,14 @@ def generate_mcqs():
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                logger.info(f"Generating MCQs (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
+                logger.info(f"Generating MCQs with enhanced question types (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
                 
                 # Invoke LangChain
                 response = chain.invoke({
                     "topic": topic,
                     "difficulty": difficulty,
-                    "num_questions": num_questions
+                    "num_questions": num_questions,
+                    "timestamp": timestamp
                 })
                 
                 # Validate generated content
@@ -345,10 +383,24 @@ def generate_mcqs():
                     # Enhance response
                     enhanced_data = enhance_response(json_data)
                     
+                    # Add question type distribution stats
+                    question_types_count = {}
+                    for question in enhanced_data.get("questions", []):
+                        q_type = question.get("question_type", "unknown")
+                        question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
+                    
+                    enhanced_data["metadata"]["question_type_distribution"] = question_types_count
+                    enhanced_data["metadata"]["enhanced_features"] = {
+                        "multi_type_questions": True,
+                        "subject_performance_tracking": True,
+                        "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
+                    }
+                    
                     # Cache the result
                     cache.set(cache_key, enhanced_data)
                     
                     logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for topic: {topic}")
+                    logger.info(f"Question type distribution: {question_types_count}")
                     return jsonify({**enhanced_data, "cached": False})
                 
                 logger.warning(f"Invalid content generated on attempt {attempt + 1}")
@@ -373,20 +425,26 @@ def generate_mcqs():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with enhanced features info"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.2.0",
+        "version": "2.3.0",
         "cache_size": len(cache.cache),
         "uptime": "Available",
         "langchain": True,
-        "pdf_support": True
+        "pdf_support": True,
+        "enhanced_features": {
+            "multi_type_questions": True,
+            "enhanced_pdf_extraction": True,
+            "subject_performance_tracking": True,
+            "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
+        }
     })
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
-    """Get API statistics"""
+    """Get API statistics with enhanced features"""
     return jsonify({
         "cache_stats": {
             "current_size": len(cache.cache),
@@ -406,7 +464,19 @@ def get_stats():
             "analytics": True,
             "langchain_integration": True,
             "pdf_upload": True,
-            "max_file_size_mb": 16
+            "max_file_size_mb": 16,
+            "enhanced_question_categories": {
+                "general_knowledge": "Broad factual information and common knowledge",
+                "quantitative_aptitude": "Mathematical calculations and numerical reasoning",
+                "verbal_ability": "Language skills, comprehension, vocabulary",
+                "technical": "Subject-specific technical concepts and procedures",
+                "logical_reasoning": "Critical thinking, patterns, logical deduction"
+            },
+            "enhanced_pdf_processing": {
+                "multi_strategy_topic_extraction": True,
+                "improved_content_analysis": True,
+                "better_fallback_mechanisms": True
+            }
         }
     })
 
@@ -424,11 +494,13 @@ def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    logger.info("Starting Enhanced MCQ Generator API with PDF Support...")
+    logger.info("Starting Enhanced MCQ Generator API v2.3.0 with Advanced Question Types...")
     logger.info(f"Cache configured: max_size={cache.max_size}, ttl={cache.ttl_seconds}s")
     logger.info(f"Rate limiting: {rate_limiter.max_requests} requests per hour")
-    logger.info(f"LangChain model: llama3-8b-8192")
+    logger.info(f"LangChain model: llama3-70b-8192")
     logger.info("PDF upload support: ENABLED (max 16MB)")
+    logger.info("Enhanced features: Multi-type questions, Enhanced PDF extraction, Subject performance tracking")
+    logger.info("Question categories: General Knowledge, Quantitative Aptitude, Verbal Ability, Technical, Logical Reasoning")
     
     app.run(
         debug=True,
