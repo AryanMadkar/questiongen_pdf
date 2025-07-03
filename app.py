@@ -5,7 +5,7 @@ from utils.Extraction_pdf import extract_text_from_pdf
 from flask import Flask, request, jsonify, render_template,render_template_string
 from utils.Helpers import validate_input,validate_generated_content,generate_cache_key,allowed_file,enhance_response,calculate_difficulty_score
 from utils.Debuger_pdf import debug_pdf_info
-
+from utils.llm_response_optimizer import optimize_llm_json_output
 
 from flask import Flask, request, jsonify, render_template,render_template_string
 from langchain_groq import ChatGroq
@@ -30,9 +30,15 @@ from werkzeug.utils import secure_filename
 from io import BytesIO
 import tempfile
 from flask_cors import CORS
+from langchain_deepseek import ChatDeepSeek
+from pydantic import SecretStr
+
+from flask_jwt_extended import (
+    JWTManager, create_access_token,
+    jwt_required, get_jwt_identity
+)
 
 load_dotenv()
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,6 +47,13 @@ httpx_client = httpx.Client()
 app = Flask(__name__)
 api_key = os.getenv('API_KEY')
 json_sort_key = os.getenv("JSON_SORT_KEYS")
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-key')
+jwt = JWTManager(app)
+
+# Change API key configuration
+DEEPSEEK_API_KEY = "sk-4123bdffbb73488a86715471da66c0a6"
+if not DEEPSEEK_API_KEY:
+    raise ValueError("DEEPSEEK_API_KEY environment variable must be set")
 CORS(
   app,
   resources={r"/*": {"origins": "*"}},
@@ -54,19 +67,91 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
 
-# Initialize LangChain components
 chat_model = ChatGroq(
-    temperature=0.2,
-    # model="llama3-8b-8192",
-    model="llama3-70b-8192",
-    api_key=GROQ_API_KEY, # type: ignore
-    max_tokens=8000,
-    http_client=httpx_client
+    api_key=SecretStr(GROQ_API_KEY) if GROQ_API_KEY is not None else None,
+    model="deepseek-r1-distill-llama-70b",
+    temperature=0.7,
+    max_tokens=8192  # Increased to ensure longer responses
 )
 
-cache = AdvancedCache(max_size=2000, ttl_seconds=7200)
+
+cache = AdvancedCache(max_size=4000, ttl_seconds=14200)
 rate_limiter = RateLimiter(max_requests=50, window_seconds=3600)
 
+# Enhanced validation function for question count
+def validate_question_count(json_data, expected_count):
+    """
+    Validate that the generated questions match the expected count
+    """
+    if not json_data or "questions" not in json_data:
+        return False, "No questions found in response"
+    
+    actual_count = len(json_data["questions"])
+    
+    # Allow small deviation (±2) for very large counts, but be strict for smaller counts
+    if expected_count <= 20:
+        tolerance = 0  # Exact match required
+    elif expected_count <= 40:
+        tolerance = 1  # Allow ±1
+    else:
+        tolerance = 2  # Allow ±2
+    
+    if abs(actual_count - expected_count) > tolerance:
+        return False, f"Expected {expected_count} questions, got {actual_count}"
+    
+    return True, f"Generated {actual_count} questions"
+
+# Enhanced content generation with retry logic for question count
+def generate_with_count_validation(chain, params, expected_count, max_retries=5):
+    """
+    Generate content with validation for question count
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Generation attempt {attempt + 1} for {expected_count} questions")
+            
+            # Invoke LangChain with explicit count emphasis
+            enhanced_params = params.copy()
+            enhanced_params["count_emphasis"] = f"IMPORTANT: Generate exactly {expected_count} questions. No more, no less."
+            
+            response = chain.invoke(enhanced_params)
+            
+            # Validate generated content
+            is_valid_content, json_data = validate_generated_content(response)
+            if is_valid_content and json_data:
+                # Validate question count
+                is_valid_count, count_message = validate_question_count(json_data, expected_count)
+                
+                if is_valid_count:
+                    logger.info(f"Successfully generated {len(json_data['questions'])} questions on attempt {attempt + 1}")
+                    return True, json_data
+                else:
+                    logger.warning(f"Question count validation failed on attempt {attempt + 1}: {count_message}")
+                    
+                    # If we have questions but wrong count, try to adjust
+                    if "questions" in json_data:
+                        actual_count = len(json_data["questions"])
+                        if actual_count > expected_count:
+                            # Trim excess questions
+                            json_data["questions"] = json_data["questions"][:expected_count]
+                            logger.info(f"Trimmed questions from {actual_count} to {expected_count}")
+                            return True, json_data
+                        elif actual_count < expected_count and actual_count > 0:
+                            # If we're close but short, and this is the last attempt, accept it
+                            shortage = expected_count - actual_count
+                            if attempt == max_retries - 1 and shortage <= 3:
+                                logger.warning(f"Accepting {actual_count} questions (short by {shortage}) on final attempt")
+                                return True, json_data
+            
+            logger.warning(f"Invalid content generated on attempt {attempt + 1}")
+            
+        except Exception as e:
+            logger.error(f"Generation attempt {attempt + 1} failed: {str(e)}")
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(1)  # Brief pause before retry
+    
+    return False, None
 
 @app.route('/info')
 def home():
@@ -110,8 +195,8 @@ def generate_mcqs_from_pdf():
         question_type = request.form.get('question_type', 'academic').lower()
         
         # Validate parameters
-        if num_questions < 1 or num_questions > 50:
-            return jsonify({"error": "Number of questions must be between 1 and 50"}), 400
+        if num_questions < 1 or num_questions > 60:
+            return jsonify({"error": "Number of questions must be between 1 and 60"}), 400
         
         if difficulty not in ["easy", "medium", "hard", "expert"]:
             return jsonify({"error": "Invalid difficulty level"}), 400
@@ -190,73 +275,55 @@ def generate_mcqs_from_pdf():
             | StrOutputParser()
         )
         
-        # Generate with retry logic
-        max_retries = 3
-        last_error = None
+        # Generate with enhanced retry logic and count validation
+        success, json_data = generate_with_count_validation(
+            chain, 
+            {
+                "topic": topic,
+                "difficulty": difficulty,
+                "num_questions": num_questions,
+                "text_content": text_content,
+                "timestamp": timestamp
+            }, 
+            num_questions
+        )
         
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Generating MCQs with enhanced question types (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
-                
-                # Invoke LangChain
-                response = chain.invoke({
-                    "topic": topic,
-                    "difficulty": difficulty,
-                    "num_questions": num_questions,
-                    "text_content": text_content,
-                    "timestamp": timestamp
-                })
-                
-                logger.debug(f"LLM Response sample: {response[:500]}...")
-                
-                # Validate generated content
-                is_valid_content, json_data = validate_generated_content(response)
-                if is_valid_content and json_data:
-                    # Enhance response with PDF-specific metadata
-                    enhanced_data = enhance_response(json_data)
-                    
-                    # Add PDF-specific metadata with enhanced question types info
-                    enhanced_data["metadata"]["source_file"] = secure_filename(file.filename) # type: ignore
-                    enhanced_data["metadata"]["content_length"] = len(text_content)
-                    enhanced_data["metadata"]["auto_generated_topic"] = topic
-                    enhanced_data["metadata"]["extraction_method"] = "Enhanced PyPDF2 with NLP"
-                    enhanced_data["metadata"]["topic_extraction_strategy"] = "Multi-strategy analysis"
-                    
-                    # Add question type distribution stats
-                    question_types_count = {}
-                    for question in enhanced_data.get("questions", []):
-                        q_type = question.get("question_type", "unknown")
-                        question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
-                    
-                    enhanced_data["metadata"]["question_type_distribution"] = question_types_count
-                    enhanced_data["metadata"]["enhanced_features"] = {
-                        "multi_type_questions": True,
-                        "subject_performance_tracking": True,
-                        "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
-                    }
-                    
-                    # Cache the result
-                    cache.set(cache_key, enhanced_data)
-                    
-                    logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions with enhanced types for topic: {topic}")
-                    logger.info(f"Question type distribution: {question_types_count}")
-                    return jsonify({**enhanced_data, "cached": False})
-                
-                logger.warning(f"Invalid content generated on attempt {attempt + 1}")
-                logger.debug(f"Raw response: {response}")
-                last_error = "Generated content validation failed"
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"Generation attempt {attempt + 1} failed: {last_error}")
-                if attempt == max_retries - 1:
-                    break
-                time.sleep(1)  # Brief pause before retry
+        if success and json_data:
+            # Enhance response with PDF-specific metadata
+            enhanced_data = enhance_response(json_data)
+            
+            # Add PDF-specific metadata with enhanced question types info
+            enhanced_data["metadata"]["source_file"] = secure_filename(file.filename) # type: ignore
+            enhanced_data["metadata"]["content_length"] = len(text_content)
+            enhanced_data["metadata"]["auto_generated_topic"] = topic
+            enhanced_data["metadata"]["extraction_method"] = "Enhanced PyPDF2 with NLP"
+            enhanced_data["metadata"]["topic_extraction_strategy"] = "Multi-strategy analysis"
+            enhanced_data["metadata"]["requested_questions"] = num_questions
+            enhanced_data["metadata"]["generated_questions"] = len(enhanced_data.get("questions", []))
+            
+            # Add question type distribution stats
+            question_types_count = {}
+            for question in enhanced_data.get("questions", []):
+                q_type = question.get("question_type", "unknown")
+                question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
+            
+            enhanced_data["metadata"]["question_type_distribution"] = question_types_count
+            enhanced_data["metadata"]["enhanced_features"] = {
+                "multi_type_questions": True,
+                "subject_performance_tracking": True,
+                "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
+            }
+            
+            # Cache the result
+            cache.set(cache_key, enhanced_data)
+            
+            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions with enhanced types for topic: {topic}")
+            logger.info(f"Question type distribution: {question_types_count}")
+            return jsonify({**enhanced_data, "cached": False})
         
         return jsonify({
             "error": "Generation failed",
-            "message": f"Unable to generate valid questions after {max_retries} attempts",
-            "last_error": last_error,
+            "message": f"Unable to generate {num_questions} valid questions after multiple attempts",
             "debug_info": {
                 "topic": topic,
                 "text_length": len(text_content),
@@ -324,7 +391,7 @@ def debug_pdf():
     
 @app.route('/generate_mcqs', methods=['POST'])
 def generate_mcqs():
-    """Enhanced MCQ generation endpoint with improved question types"""
+    """Enhanced MCQ generation endpoint with improved question types and count validation"""
     try:
         data = request.get_json()
         
@@ -338,6 +405,10 @@ def generate_mcqs():
         difficulty = data.get("difficulty", "medium").lower()
         num_questions = data.get("num_questions", 5)
         question_type = data.get("question_type", "academic")
+        
+        # Validate question count
+        if num_questions < 1 or num_questions > 60:
+            return jsonify({"error": "Number of questions must be between 1 and 60"}), 400
         
         # Check rate limiting
         client_ip = request.remote_addr
@@ -363,57 +434,49 @@ def generate_mcqs():
             | StrOutputParser()
         )
         
-        # Generate with retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Generating MCQs with enhanced question types (attempt {attempt + 1}) - Topic: {topic}, Difficulty: {difficulty}")
-                
-                # Invoke LangChain
-                response = chain.invoke({
-                    "topic": topic,
-                    "difficulty": difficulty,
-                    "num_questions": num_questions,
-                    "timestamp": timestamp
-                })
-                
-                # Validate generated content
-                is_valid_content, json_data = validate_generated_content(response)
-                if is_valid_content and json_data:
-                    # Enhance response
-                    enhanced_data = enhance_response(json_data)
-                    
-                    # Add question type distribution stats
-                    question_types_count = {}
-                    for question in enhanced_data.get("questions", []):
-                        q_type = question.get("question_type", "unknown")
-                        question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
-                    
-                    enhanced_data["metadata"]["question_type_distribution"] = question_types_count
-                    enhanced_data["metadata"]["enhanced_features"] = {
-                        "multi_type_questions": True,
-                        "subject_performance_tracking": True,
-                        "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
-                    }
-                    
-                    # Cache the result
-                    cache.set(cache_key, enhanced_data)
-                    
-                    logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for topic: {topic}")
-                    logger.info(f"Question type distribution: {question_types_count}")
-                    return jsonify({**enhanced_data, "cached": False})
-                
-                logger.warning(f"Invalid content generated on attempt {attempt + 1}")
-                
-            except Exception as e:
-                logger.error(f"Generation attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(1)  # Brief pause before retry
+        # Generate with enhanced retry logic and count validation
+        success, json_data = generate_with_count_validation(
+            chain, 
+            {
+                "topic": topic,
+                "difficulty": difficulty,
+                "num_questions": num_questions,
+                "timestamp": timestamp
+            }, 
+            num_questions
+        )
+        
+        if success and json_data:
+            # Enhance response
+            enhanced_data = enhance_response(json_data)
+            
+            # Add metadata with question count info
+            enhanced_data["metadata"]["requested_questions"] = num_questions
+            enhanced_data["metadata"]["generated_questions"] = len(enhanced_data.get("questions", []))
+            
+            # Add question type distribution stats
+            question_types_count = {}
+            for question in enhanced_data.get("questions", []):
+                q_type = question.get("question_type", "unknown")
+                question_types_count[q_type] = question_types_count.get(q_type, 0) + 1
+            
+            enhanced_data["metadata"]["question_type_distribution"] = question_types_count
+            enhanced_data["metadata"]["enhanced_features"] = {
+                "multi_type_questions": True,
+                "subject_performance_tracking": True,
+                "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
+            }
+            
+            # Cache the result
+            cache.set(cache_key, enhanced_data)
+            
+            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for topic: {topic}")
+            logger.info(f"Question type distribution: {question_types_count}")
+            return jsonify({**enhanced_data, "cached": False})
         
         return jsonify({
             "error": "Generation failed",
-            "message": "Unable to generate valid questions after multiple attempts"
+            "message": f"Unable to generate {num_questions} valid questions after multiple attempts"
         }), 500
         
     except Exception as e:
@@ -429,7 +492,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.3.0",
+        "version": "2.4.0",
         "cache_size": len(cache.cache),
         "uptime": "Available",
         "langchain": True,
@@ -438,6 +501,7 @@ def health_check():
             "multi_type_questions": True,
             "enhanced_pdf_extraction": True,
             "subject_performance_tracking": True,
+            "question_count_validation": True,
             "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
         }
     })
@@ -458,7 +522,8 @@ def get_stats():
         "supported_features": {
             "question_types": ["academic", "practical", "conceptual"],
             "difficulty_levels": ["easy", "medium", "hard", "expert"],
-            "max_questions": 50,
+            "max_questions": 60,
+            "question_count_validation": True,
             "bloom_taxonomy": True,
             "explanations": True,
             "analytics": True,
@@ -494,12 +559,12 @@ def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    logger.info("Starting Enhanced MCQ Generator API v2.3.0 with Advanced Question Types...")
+    logger.info("Starting Enhanced MCQ Generator API v2.4.0 with Question Count Validation...")
     logger.info(f"Cache configured: max_size={cache.max_size}, ttl={cache.ttl_seconds}s")
     logger.info(f"Rate limiting: {rate_limiter.max_requests} requests per hour")
-    logger.info(f"LangChain model: llama3-70b-8192")
+    logger.info(f"LangChain model: deepseek-r1-distill-llama-70b")
     logger.info("PDF upload support: ENABLED (max 16MB)")
-    logger.info("Enhanced features: Multi-type questions, Enhanced PDF extraction, Subject performance tracking")
+    logger.info("Enhanced features: Multi-type questions, Enhanced PDF extraction, Subject performance tracking, Question count validation")
     logger.info("Question categories: General Knowledge, Quantitative Aptitude, Verbal Ability, Technical, Logical Reasoning")
     
     app.run(
