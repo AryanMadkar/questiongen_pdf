@@ -69,7 +69,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
 
 chat_model = ChatGroq(
     api_key=SecretStr(GROQ_API_KEY) if GROQ_API_KEY is not None else None,
-    model="deepseek-r1-distill-llama-70b",
+    model="llama3-70b-8192",
     temperature=0.7,
     max_tokens=8192  # Increased to ensure longer responses
 )
