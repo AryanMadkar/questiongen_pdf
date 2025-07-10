@@ -1,13 +1,14 @@
 from AdvanceCache.Caching import AdvancedCache
 from Ratelimiter.Limiter import RateLimiter
-from prompt_templates.Templates import build_prompt_template, build_prompt_template_pdf, extract_topic_from_pdf_content
+from prompt_templates.Templates import build_prompt_template,build_prompt_template_pdf,extract_topic_from_pdf_content
 from utils.Extraction_pdf import extract_text_from_pdf
-from flask import Flask, request, jsonify, render_template, render_template_string
-from utils.Helpers import validate_input, validate_generated_content, generate_cache_key, allowed_file, enhance_response, calculate_difficulty_score
+from flask import Flask, request, jsonify, render_template,render_template_string
+from utils.Helpers import validate_input,validate_generated_content,generate_cache_key,allowed_file,enhance_response,calculate_difficulty_score
 from utils.Debuger_pdf import debug_pdf_info
+from utils.llm_response_optimizer import optimize_llm_json_output
 
-
-from langchain_groq import ChatGroq
+from flask import Flask, request, jsonify, render_template,render_template_string
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -24,13 +25,19 @@ import threading
 from collections import defaultdict
 from dotenv import load_dotenv
 import httpx
-import PyPDF2  # type: ignore
+import PyPDF2 # type: ignore
 from werkzeug.utils import secure_filename
 from io import BytesIO
 import tempfile
 from flask_cors import CORS
-from langchain_deepseek import ChatDeepSeek
 from pydantic import SecretStr
+import bcrypt
+
+from flask_jwt_extended import (
+    JWTManager, create_access_token,
+    jwt_required, get_jwt_identity,
+    get_jwt
+)
 
 load_dotenv()
 
@@ -43,11 +50,17 @@ app = Flask(__name__)
 api_key = os.getenv('API_KEY')
 json_sort_key = os.getenv("JSON_SORT_KEYS", "JSON_SORT_KEYS")
 
-# Change API key configuration
-DEEPSEEK_API_KEY = "sk-4123bdffbb73488a86715471da66c0a6"
-if not DEEPSEEK_API_KEY:
-    raise ValueError("DEEPSEEK_API_KEY environment variable must be set")
+# JWT Configuration
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-key-change-this-in-production')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+jwt = JWTManager(app)
 
+# Google Gemini API Configuration
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable must be set")
+
+# CORS Configuration
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -59,19 +72,37 @@ CORS(
 app.config[json_sort_key] = False
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# Configuration
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
-
-chat_model = ChatGroq(
-    api_key=SecretStr(GROQ_API_KEY) if GROQ_API_KEY is not None else None,
-    model="llama3-70b-8192",
+# Initialize Google Gemini Chat Model
+chat_model = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.7,
-    max_tokens=8192  # Increased to ensure longer responses
+    max_tokens=8192,
+    convert_system_message_to_human=True
 )
 
+# Initialize cache and rate limiter
 cache = AdvancedCache(max_size=4000, ttl_seconds=14200)
 rate_limiter = RateLimiter(max_requests=50, window_seconds=3600)
 
+# Simple user store (in production, use a proper database)
+users = {
+    "admin": {
+        "password": bcrypt.hashpw("admin123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+        "role": "admin"
+    },
+    "user": {
+        "password": bcrypt.hashpw("user123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+        "role": "user"
+    }
+}
+
+# JWT token blacklist (in production, use Redis or database)
+blacklisted_tokens = set()
+
+@jwt.token_in_blocklist_loader
+def check_if_token_revoked(jwt_header, jwt_payload):
+    return jwt_payload['jti'] in blacklisted_tokens
 
 # Enhanced validation function for question count
 def validate_question_count(json_data, expected_count):
@@ -95,7 +126,6 @@ def validate_question_count(json_data, expected_count):
         return False, f"Expected {expected_count} questions, got {actual_count}"
     
     return True, f"Generated {actual_count} questions"
-
 
 # Enhanced content generation with retry logic for question count
 def generate_with_count_validation(chain, params, expected_count, max_retries=5):
@@ -149,23 +179,113 @@ def generate_with_count_validation(chain, params, expected_count, max_retries=5)
     
     return False, None
 
+# Authentication Routes
+@app.route('/register', methods=['POST'])
+def register():
+    """User registration endpoint"""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({'error': 'Username and password required'}), 400
+        
+        username = data['username']
+        password = data['password']
+        
+        if username in users:
+            return jsonify({'error': 'Username already exists'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters long'}), 400
+        
+        # Hash password
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        # Add user (in production, save to database)
+        users[username] = {
+            'password': hashed_password,
+            'role': 'user'
+        }
+        
+        return jsonify({'message': 'User registered successfully'}), 201
+        
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    """User login endpoint"""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({'error': 'Username and password required'}), 400
+        
+        username = data['username']
+        password = data['password']
+        
+        if username not in users:
+            return jsonify({'error': 'Invalid username or password'}), 401
+        
+        user = users[username]
+        if not bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+            return jsonify({'error': 'Invalid username or password'}), 401
+        
+        # Create access token
+        access_token = create_access_token(
+            identity=username,
+            additional_claims={'role': user['role']}
+        )
+        
+        return jsonify({
+            'access_token': access_token,
+            'user': {
+                'username': username,
+                'role': user['role']
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    """User logout endpoint"""
+    try:
+        token = get_jwt()
+        jti = token['jti']
+        blacklisted_tokens.add(jti)
+        return jsonify({'message': 'Successfully logged out'}), 200
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({'error': 'Logout failed'}), 500
+
+@app.route('/protected', methods=['GET'])
+@jwt_required()
+def protected():
+    """Protected route example"""
+    current_user = get_jwt_identity()
+    return jsonify({'message': f'Hello {current_user}', 'user': current_user}), 200
 
 @app.route('/info')
 def home():
     """API documentation page"""
     return render_template("index.html")
 
-
 @app.route('/')
 def home2():
     """API documentation page"""
     return render_template("Home.html")
 
-
 @app.route('/generate_mcqs_from_pdf', methods=['POST'])
+@jwt_required()
 def generate_mcqs_from_pdf():
     """Generate MCQs from uploaded PDF file with enhanced question types and improved topic extraction"""
     try:
+        current_user = get_jwt_identity()
+        logger.info(f"PDF MCQ generation request from user: {current_user}")
+        
         # Check if file is present
         if 'pdf_file' not in request.files:
             return jsonify({"error": "No PDF file provided"}), 400
@@ -290,13 +410,14 @@ def generate_mcqs_from_pdf():
             enhanced_data = enhance_response(json_data)
             
             # Add PDF-specific metadata with enhanced question types info
-            enhanced_data["metadata"]["source_file"] = secure_filename(file.filename)  # type: ignore
+            enhanced_data["metadata"]["source_file"] = secure_filename(file.filename) # type: ignore
             enhanced_data["metadata"]["content_length"] = len(text_content)
             enhanced_data["metadata"]["auto_generated_topic"] = topic
             enhanced_data["metadata"]["extraction_method"] = "Enhanced PyPDF2 with NLP"
             enhanced_data["metadata"]["topic_extraction_strategy"] = "Multi-strategy analysis"
             enhanced_data["metadata"]["requested_questions"] = num_questions
             enhanced_data["metadata"]["generated_questions"] = len(enhanced_data.get("questions", []))
+            enhanced_data["metadata"]["generated_by"] = current_user
             
             # Add question type distribution stats
             question_types_count = {}
@@ -337,11 +458,14 @@ def generate_mcqs_from_pdf():
             "details": str(e)
         }), 500
 
-
 @app.route('/debug_pdf', methods=['POST'])
+@jwt_required()
 def debug_pdf():
     """Debug endpoint to check PDF processing with enhanced topic extraction"""
     try:
+        current_user = get_jwt_identity()
+        logger.info(f"PDF debug request from user: {current_user}")
+        
         if 'pdf_file' not in request.files:
             return jsonify({"error": "No PDF file provided"}), 400
         
@@ -362,7 +486,8 @@ def debug_pdf():
             "extraction_result": text_content if success else None,
             "extraction_error": text_content if not success else None,
             "text_length": len(text_content) if success else 0,
-            "text_sample": text_content[:500] + "..." if success and len(text_content) > 500 else text_content if success else None
+            "text_sample": text_content[:500] + "..." if success and len(text_content) > 500 else text_content if success else None,
+            "debugged_by": current_user
         }
         
         if success:
@@ -384,11 +509,14 @@ def debug_pdf():
         logger.error(f"Debug PDF error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/generate_mcqs', methods=['POST'])
+@jwt_required()
 def generate_mcqs():
     """Enhanced MCQ generation endpoint with improved question types and count validation"""
     try:
+        current_user = get_jwt_identity()
+        logger.info(f"MCQ generation request from user: {current_user}")
+        
         data = request.get_json()
         
         # Validate input
@@ -449,6 +577,7 @@ def generate_mcqs():
             # Add metadata with question count info
             enhanced_data["metadata"]["requested_questions"] = num_questions
             enhanced_data["metadata"]["generated_questions"] = len(enhanced_data.get("questions", []))
+            enhanced_data["metadata"]["generated_by"] = current_user
             
             # Add question type distribution stats
             question_types_count = {}
@@ -482,18 +611,19 @@ def generate_mcqs():
             "message": "An unexpected error occurred"
         }), 500
 
-
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint with enhanced features info"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.4.0",
+        "version": "2.5.0",
         "cache_size": len(cache.cache),
         "uptime": "Available",
         "langchain": True,
         "pdf_support": True,
+        "ai_model": "Google Gemini 1.5 Flash",
+        "jwt_auth": True,
         "enhanced_features": {
             "multi_type_questions": True,
             "enhanced_pdf_extraction": True,
@@ -502,7 +632,6 @@ def health_check():
             "question_categories": ["general_knowledge", "quantitative_aptitude", "verbal_ability", "technical", "logical_reasoning"]
         }
     })
-
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
@@ -528,6 +657,8 @@ def get_stats():
             "langchain_integration": True,
             "pdf_upload": True,
             "max_file_size_mb": 16,
+            "ai_model": "Google Gemini 1.5 Flash",
+            "jwt_authentication": True,
             "enhanced_question_categories": {
                 "general_knowledge": "Broad factual information and common knowledge",
                 "quantitative_aptitude": "Mathematical calculations and numerical reasoning",
@@ -543,31 +674,50 @@ def get_stats():
         }
     })
 
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
 
-
 @app.errorhandler(413)
 def too_large(error):
     return jsonify({"error": "File too large", "message": "Maximum file size is 16MB"}), 413
-
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Internal server error: {str(error)}")
     return jsonify({"error": "Internal server error"}), 500
 
+# JWT Error Handlers
+@app.errorhandler(422)
+def handle_unprocessable_entity(e):
+    return jsonify({"error": "Invalid token"}), 422
+
+@app.errorhandler(401)
+def handle_unauthorized(e):
+    return jsonify({"error": "Unauthorized - Invalid or missing token"}), 401
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return jsonify({"error": "Token has expired"}), 401
+
+@jwt.invalid_token_loader
+def invalid_token_callback(error):
+    return jsonify({"error": "Invalid token"}), 401
+
+@jwt.unauthorized_loader
+def missing_token_callback(error): 
+    return jsonify({"error": "Authorization token is required"}), 401
 
 if __name__ == "__main__":
-    logger.info("Starting Enhanced MCQ Generator API v2.4.0 with Question Count Validation...")
+    logger.info("Starting Enhanced MCQ Generator API v2.5.0 with Google Gemini and JWT Authentication...")
     logger.info(f"Cache configured: max_size={cache.max_size}, ttl={cache.ttl_seconds}s")
     logger.info(f"Rate limiting: {rate_limiter.max_requests} requests per hour")
-    logger.info(f"LangChain model: llama3-70b-8192")
+    logger.info(f"AI Model: Google Gemini 1.5 Flash")
     logger.info("PDF upload support: ENABLED (max 16MB)")
+    logger.info("JWT Authentication: ENABLED")
     logger.info("Enhanced features: Multi-type questions, Enhanced PDF extraction, Subject performance tracking, Question count validation")
     logger.info("Question categories: General Knowledge, Quantitative Aptitude, Verbal Ability, Technical, Logical Reasoning")
+    logger.info("Default users: admin/admin123, user/user123")
     
     app.run(
         debug=True,

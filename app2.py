@@ -4,7 +4,7 @@ from prompt_templates.Templates import build_prompt_template, build_prompt_templ
 from utils.Extraction_pdf import extract_text_from_pdf
 from utils.Helpers import validate_input, validate_generated_content, generate_cache_key, allowed_file, enhance_response, calculate_difficulty_score
 from utils.Debuger_pdf import debug_pdf_info
-
+from flask_jwt_extended import create_access_token, set_access_cookies, unset_jwt_cookies
 from flask import Flask, request, jsonify, render_template
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,6 +17,7 @@ from flask_cors import CORS
 from langchain_deepseek import ChatDeepSeek
 from pydantic import SecretStr
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 
 import os
 import json
@@ -37,44 +38,66 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# In-memory user storage (use database in production)
+users = {
+    "admin": {
+        "password": generate_password_hash("admin123"), 
+        "role": "admin"
+    },
+}
+
 # JWT Configuration
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-key')
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-key-change-in-production')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
-app.config['JWT_TOKEN_LOCATION'] = ['cookies']
-app.config['JWT_COOKIE_SECURE'] = True  # Set to True in production
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Set to True in production for CSRF protection
+app.config['JWT_TOKEN_LOCATION'] = ['cookies', 'headers']  # Support both cookies and headers
+app.config['JWT_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Set to True in production
 app.config['JWT_COOKIE_SAMESITE'] = 'Lax'
+app.config['JWT_COOKIE_HTTPONLY'] = True  # Prevent XSS attacks
 
 jwt = JWTManager(app)
 
-# CORS Configuration
+# CORS Configuration - More restrictive in production
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}},
+    resources={r"/*": {"origins": "*"}},  # Restrict to specific origins in production
     supports_credentials=True,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"]
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
 )
 
 # App Configuration
 app.config['JSON_SORT_KEYS'] = False
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# API Keys
-api_key = os.getenv('API_KEY')
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", api_key)
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-4123bdffbb73488a86715471da66c0a6")
+# API Keys with proper validation
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-if not DEEPSEEK_API_KEY:
-    raise ValueError("DEEPSEEK_API_KEY environment variable must be set")
+if not GROQ_API_KEY and not DEEPSEEK_API_KEY:
+    raise ValueError("Either GROQ_API_KEY or DEEPSEEK_API_KEY environment variable must be set")
 
-# Initialize LLM
-chat_model = ChatGroq(
-    api_key=SecretStr(GROQ_API_KEY) if GROQ_API_KEY is not None else None,
-    model="deepseek-r1-distill-llama-70b",
-    temperature=0.7,
-    max_tokens=8192
-)
+# Initialize LLM with fallback logic
+try:
+    if GROQ_API_KEY:
+        chat_model = ChatGroq(
+            api_key=SecretStr(GROQ_API_KEY),
+            model="llama3-70b-8192",
+            temperature=0.7,
+            max_tokens=8192
+        )
+        logger.info("Using Groq model")
+    elif DEEPSEEK_API_KEY:
+        chat_model = ChatDeepSeek(
+            api_key=SecretStr(DEEPSEEK_API_KEY),
+            model="deepseek-r1-distill-llama-70b",
+            temperature=0.7,
+            max_tokens=8192
+        )
+        logger.info("Using DeepSeek model")
+except Exception as e:
+    logger.error(f"Failed to initialize chat model: {str(e)}")
+    raise
 
 # Initialize cache and rate limiter
 cache = AdvancedCache(max_size=4000, ttl_seconds=14200)
@@ -102,7 +125,7 @@ def missing_token_callback(error):
         'message': 'Please log in to access this resource'
     }), 401
 
-# Custom JWT verification decorator for cookies
+# Custom JWT verification decorator
 def jwt_required_custom(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -115,6 +138,17 @@ def jwt_required_custom(f):
                 'error': 'Authentication failed',
                 'message': 'Invalid or missing authentication token'
             }), 401
+    return decorated_function
+
+# Admin role checker
+def admin_required(f):
+    @wraps(f)
+    @jwt_required_custom
+    def decorated_function(*args, **kwargs):
+        user = get_jwt_identity()
+        if not user or user.get("role") != "admin":
+            return jsonify({"error": "Admin access required"}), 403
+        return f(*args, **kwargs)
     return decorated_function
 
 # Enhanced validation function for question count
@@ -139,7 +173,7 @@ def validate_question_count(json_data, expected_count):
     return True, f"Generated {actual_count} questions"
 
 # Enhanced content generation with retry logic
-def generate_with_count_validation(chain, params, expected_count, max_retries=5):
+def generate_with_count_validation(chain, params, expected_count, max_retries=3):
     """Generate content with validation for question count"""
     for attempt in range(max_retries):
         try:
@@ -190,8 +224,15 @@ def generate_with_count_validation(chain, params, expected_count, max_retries=5)
 # Routes
 @app.route('/')
 def home():
-    """Home page"""
+    """Home page - No authentication required for public access"""
     return render_template("Home.html")
+
+@app.route('/dashboard')
+@jwt_required_custom
+def dashboard():
+    """Protected dashboard for authenticated users"""
+    current_user = get_jwt_identity()
+    return render_template("dashboard.html", user=current_user)
 
 @app.route('/generate_mcqs', methods=['POST'])
 @jwt_required_custom
@@ -202,20 +243,41 @@ def generate_mcqs():
         current_user = get_jwt_identity()
         logger.info(f"MCQ generation request from user: {current_user}")
         
+        # Validate request content type
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+        
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
         
         # Validate input
         is_valid, error_msg = validate_input(data)
         if not is_valid:
             return jsonify({"error": "Validation failed", "message": error_msg}), 400
         
-        # Extract parameters
-        topic = data["topic"].strip()
+        # Extract parameters with proper validation
+        topic = data.get("topic", "").strip()
+        if not topic:
+            return jsonify({"error": "Topic is required"}), 400
+        
         difficulty = data.get("difficulty", "medium").lower()
         num_questions = data.get("num_questions", 5)
-        question_type = data.get("question_type", "academic")
+        question_type = data.get("question_type", "academic").lower()
+        
+        # Validate parameters
+        if difficulty not in ["easy", "medium", "hard", "expert"]:
+            return jsonify({"error": "Invalid difficulty level"}), 400
+            
+        if question_type not in ["academic", "practical", "conceptual"]:
+            return jsonify({"error": "Invalid question type"}), 400
         
         # Validate question count
+        try:
+            num_questions = int(num_questions)
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid num_questions parameter"}), 400
+            
         if num_questions < 1 or num_questions > 60:
             return jsonify({"error": "Number of questions must be between 1 and 60"}), 400
         
@@ -260,7 +322,7 @@ def generate_mcqs():
             enhanced_data = enhance_response(json_data)
             
             # Add metadata
-            enhanced_data["metadata"]["user_id"] = current_user
+            enhanced_data["metadata"]["user_id"] = current_user.get("username", "unknown")
             enhanced_data["metadata"]["requested_questions"] = num_questions
             enhanced_data["metadata"]["generated_questions"] = len(enhanced_data.get("questions", []))
             
@@ -275,7 +337,7 @@ def generate_mcqs():
             # Cache the result
             cache.set(cache_key, enhanced_data)
             
-            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for user: {current_user}")
+            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions for user: {current_user.get('username')}")
             return jsonify({**enhanced_data, "cached": False})
         
         return jsonify({
@@ -311,14 +373,10 @@ def generate_mcqs_from_pdf():
         if not allowed_file(file.filename):
             return jsonify({"error": "Only PDF files are allowed"}), 400
         
-        # Additional file validation
-        if file.content_length and file.content_length > 16 * 1024 * 1024:
-            return jsonify({"error": "File too large. Maximum size is 16MB"}), 400
-        
-        # Get parameters
+        # Get parameters with proper validation
         try:
             num_questions = int(request.form.get('num_questions', 10))
-        except ValueError:
+        except (ValueError, TypeError):
             return jsonify({"error": "Invalid num_questions parameter"}), 400
             
         difficulty = request.form.get('difficulty', 'medium').lower()
@@ -339,7 +397,7 @@ def generate_mcqs_from_pdf():
         if not rate_limiter.is_allowed(client_ip):
             return jsonify({"error": "Rate limit exceeded"}), 429
         
-        logger.info(f"Processing PDF upload from user {current_user}: {file.filename}")
+        logger.info(f"Processing PDF upload from user {current_user.get('username')}: {file.filename}")
         
         # Extract text from PDF
         success, text_content = extract_text_from_pdf(file)
@@ -404,7 +462,7 @@ def generate_mcqs_from_pdf():
             enhanced_data = enhance_response(json_data)
             
             # Add PDF-specific metadata
-            enhanced_data["metadata"]["user_id"] = current_user
+            enhanced_data["metadata"]["user_id"] = current_user.get("username", "unknown")
             enhanced_data["metadata"]["source_file"] = secure_filename(file.filename)
             enhanced_data["metadata"]["content_length"] = len(text_content)
             enhanced_data["metadata"]["auto_generated_topic"] = topic
@@ -414,7 +472,7 @@ def generate_mcqs_from_pdf():
             # Cache the result
             cache.set(cache_key, enhanced_data)
             
-            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions from PDF for user: {current_user}")
+            logger.info(f"Successfully generated {len(enhanced_data.get('questions', []))} questions from PDF for user: {current_user.get('username')}")
             return jsonify({**enhanced_data, "cached": False})
         
         return jsonify({
@@ -453,10 +511,138 @@ def protected_health():
     current_user = get_jwt_identity()
     return jsonify({
         "status": "healthy",
-        "user": current_user,
+        "user": current_user.get("username", "unknown"),
+        "role": current_user.get("role", "user"),
         "timestamp": datetime.now().isoformat(),
         "message": "Authentication successful"
     })
+
+@app.route('/register', methods=['POST'])
+def register():
+    """User registration endpoint"""
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+        role = data.get("role", "user").lower()
+
+        # Validate input
+        if not username or not password:
+            return jsonify({"error": "Username and password are required"}), 400
+        
+        if len(username) < 3:
+            return jsonify({"error": "Username must be at least 3 characters long"}), 400
+            
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters long"}), 400
+            
+        if role not in ["user", "admin"]:
+            return jsonify({"error": "Invalid role. Must be 'user' or 'admin'"}), 400
+
+        if username in users:
+            return jsonify({"error": "User already exists"}), 409
+
+        # Hash password and store user
+        users[username] = {
+            "password": generate_password_hash(password), 
+            "role": role
+        }
+        
+        logger.info(f"New user registered: {username} with role: {role}")
+        return jsonify({"message": f"User {username} registered successfully"}), 201
+        
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        return jsonify({"error": "Registration failed"}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    """User login endpoint"""
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+
+        if not username or not password:
+            return jsonify({"error": "Username and password are required"}), 400
+
+        user = users.get(username)
+        if not user or not check_password_hash(user["password"], password):
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        # Create JWT token
+        access_token = create_access_token(
+            identity={"username": username, "role": user["role"]}
+        )
+        
+        response = jsonify({
+            "message": "Login successful",
+            "user": {"username": username, "role": user["role"]}
+        })
+        set_access_cookies(response, access_token)
+        
+        logger.info(f"User logged in: {username}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({"error": "Login failed"}), 500
+
+@app.route('/logout', methods=['POST'])
+@jwt_required_custom
+def logout():
+    """User logout endpoint"""
+    try:
+        current_user = get_jwt_identity()
+        response = jsonify({"message": "Logged out successfully"})
+        unset_jwt_cookies(response)
+        
+        logger.info(f"User logged out: {current_user.get('username', 'unknown')}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({"error": "Logout failed"}), 500
+
+@app.route('/admin-panel', methods=['GET'])
+@admin_required
+def admin_panel():
+    """Admin panel endpoint - Admin access required"""
+    user = get_jwt_identity()
+    return jsonify({
+        "message": f"Welcome to the admin panel, {user['username']}",
+        "user": user,
+        "total_users": len(users),
+        "cache_stats": {
+            "size": len(cache.cache),
+            "max_size": cache.max_size,
+            "ttl": cache.ttl_seconds
+        }
+    })
+
+@app.route('/users', methods=['GET'])
+@admin_required
+def list_users():
+    """List all users - Admin only"""
+    user_list = []
+    for username, user_data in users.items():
+        user_list.append({
+            "username": username,
+            "role": user_data["role"]
+        })
+    return jsonify({"users": user_list})
 
 # Error handlers
 @app.errorhandler(404)
@@ -472,15 +658,18 @@ def internal_error(error):
     logger.error(f"Internal server error: {str(error)}")
     return jsonify({"error": "Internal server error"}), 500
 
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({"error": "Method not allowed"}), 405
+
 if __name__ == "__main__":
     logger.info("Starting JWT-Protected MCQ Generator API v3.0.0...")
     logger.info(f"JWT Secret Key configured: {'Yes' if app.config['JWT_SECRET_KEY'] else 'No'}")
     logger.info(f"Cache configured: max_size={cache.max_size}, ttl={cache.ttl_seconds}s")
     logger.info(f"Rate limiting: {rate_limiter.max_requests} requests per hour")
-    logger.info(f"LangChain model: deepseek-r1-distill-llama-70b")
     logger.info("PDF upload support: ENABLED (max 16MB)")
     logger.info("JWT Authentication: ENABLED (Cookie-based)")
-    logger.info("Protected routes: /generate_mcqs, /generate_mcqs_from_pdf, /protected-health")
+    logger.info("Protected routes: /generate_mcqs, /generate_mcqs_from_pdf, /protected-health, /admin-panel")
     
     app.run(
         debug=True,
